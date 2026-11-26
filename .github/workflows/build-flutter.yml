@@ -1,0 +1,315 @@
+
+name: Flutter Build Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Build Job ID
+        required: true
+        type: string
+      userId:
+        description: User ID
+        required: true
+        type: string
+      payload:
+        description: Build Payload JSON
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: flutter-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Flutter APK Builder
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+      CI: true
+      FLUTTER_SUPPRESS_ANALYTICS: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize
+        id: init
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$RUNNER_TEMP/source"
+          mkdir -p "$RUNNER_TEMP/logs"
+          mkdir -p output
+
+          printf '%s' "$PAYLOAD" > "$RUNNER_TEMP/payload.json"
+
+          node -e "
+            JSON.parse(require('fs').readFileSync(
+              process.argv[1], 'utf8'
+            ));
+          " "$RUNNER_TEMP/payload.json"
+
+          TYPE=$(node -e "
+            const p=require(process.argv[1]);
+            process.stdout.write(String(p.buildType || 'release'));
+          " "$RUNNER_TEMP/payload.json")
+
+          TYPE=$(echo "$TYPE" | tr '[:upper:]' '[:lower:]')
+
+          if [[ "$TYPE" != "debug" && "$TYPE" != "release" ]]; then
+            TYPE=release
+          fi
+
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "# Flutter Build Report"
+            echo ""
+            echo "- Job: $JOB_ID"
+            echo "- User: $USER_ID"
+            echo "- Variant: $TYPE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          cache-dependency-path: "**/pubspec.lock"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Download Project
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          ZIP_URL=$(node -e "
+            const p=require(process.argv[1]);
+            process.stdout.write(p.zipAssetUrl || '');
+          " "$RUNNER_TEMP/payload.json")
+
+          SOURCE_URL=$(node -e "
+            const p=require(process.argv[1]);
+            process.stdout.write(p.url || p.sourceUrl || '');
+          " "$RUNNER_TEMP/payload.json")
+
+          if [[ -n "$ZIP_URL" ]]; then
+            curl -fL --retry 4 --retry-all-errors \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "$ZIP_URL" -o "$RUNNER_TEMP/project.zip"
+
+          elif [[ -n "$SOURCE_URL" ]]; then
+            curl -fL --retry 4 --retry-all-errors \
+              "$SOURCE_URL" -o "$RUNNER_TEMP/project.zip"
+
+          else
+            echo "::error::Project source missing"
+            exit 1
+          fi
+
+          unzip -q "$RUNNER_TEMP/project.zip" \
+            -d "$RUNNER_TEMP/source"
+
+          ROOT=$(find "$RUNNER_TEMP/source" \
+            -type f -name pubspec.yaml \
+            -printf '%h\n' | sort | head -n1)
+
+          if [[ -z "$ROOT" ]]; then
+            echo "::error::Flutter pubspec.yaml not found"
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Flutter Environment
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          flutter --version \
+            | tee "$RUNNER_TEMP/logs/flutter.log"
+
+          dart --version 2>&1 \
+            | tee "$RUNNER_TEMP/logs/dart.log"
+
+          flutter doctor -v 2>&1 \
+            | tee "$RUNNER_TEMP/logs/doctor.log" || true
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Resolve Dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          set +e
+          flutter pub get -v 2>&1 \
+            | tee "$RUNNER_TEMP/logs/pub-get.log"
+
+          CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "$CODE" -ne 0 ]]; then
+            echo "::warning::Repairing Flutter package cache"
+
+            flutter pub cache repair \
+              2>&1 | tee "$RUNNER_TEMP/logs/cache-repair.log" || true
+
+            flutter pub get -v \
+              2>&1 | tee -a "$RUNNER_TEMP/logs/pub-get.log"
+          fi
+
+      - name: Build APK with Recovery
+        id: build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          TYPE="${{ steps.init.outputs.type }}"
+          LOG="$RUNNER_TEMP/logs/build.log"
+          SUCCESS=0
+
+          build() {
+            local attempt="$1"
+            shift
+
+            echo "::group::Flutter Attempt $attempt"
+
+            set +e
+            flutter build apk "$@" -v \
+              2>&1 | tee -a "$LOG"
+
+            CODE=${PIPESTATUS[0]}
+            set -e
+
+            echo "::endgroup::"
+
+            return "$CODE"
+          }
+
+          # Attempt 1
+          build 1 "--$TYPE" && SUCCESS=1 || true
+
+          # Attempt 2
+          if [[ "$SUCCESS" -eq 0 ]]; then
+            echo "::warning::Refreshing package resolution"
+
+            flutter pub get -v \
+              2>&1 | tee -a "$LOG" || true
+
+            build 2 "--$TYPE" && SUCCESS=1 || true
+          fi
+
+          # Attempt 3
+          if [[ "$SUCCESS" -eq 0 ]]; then
+            echo "::warning::Cleaning generated build files"
+
+            flutter clean 2>&1 | tee -a "$LOG" || true
+
+            flutter pub get -v \
+              2>&1 | tee -a "$LOG" || true
+
+            build 3 "--$TYPE" && SUCCESS=1 || true
+          fi
+
+          # Attempt 4
+          if [[ "$SUCCESS" -eq 0 ]]; then
+            echo "::warning::Final build retry"
+
+            build 4 "--$TYPE" && SUCCESS=1 || true
+          fi
+
+          if [[ "$SUCCESS" -eq 0 ]]; then
+            echo "::error::Flutter build failed"
+            exit 1
+          fi
+
+          APK=$(find build/app/outputs/flutter-apk \
+            -maxdepth 1 -type f \
+            -name "*-$TYPE.apk" | head -n1)
+
+          if [[ -z "$APK" ]]; then
+            echo "::error::Expected APK not found"
+            exit 1
+          fi
+
+          cp "$APK" "$GITHUB_WORKSPACE/output/"
+
+      - name: Validate APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          APK=$(find output -type f -name "*.apk" | head -n1)
+
+          test -n "$APK"
+
+          SIZE=$(stat -c%s "$APK")
+          HASH=$(sha256sum "$APK" | awk '{print $1}')
+
+          if (( SIZE < 10240 )); then
+            echo "::error::APK is too small"
+            exit 1
+          fi
+
+          {
+            echo "## APK Validation"
+            echo "- File: $(basename "$APK")"
+            echo "- Size: $SIZE bytes"
+            echo "- SHA256: $HASH"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload Diagnostic Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-diagnostics-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/logs/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Final Summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "## Final Status"
+            echo "- Status: ${{ job.status }}"
+            echo "- Job: $JOB_ID"
+            echo "- Variant: ${{ steps.init.outputs.type }}"
+          } >> "$GITHUB_STEP_SUMMARY"
